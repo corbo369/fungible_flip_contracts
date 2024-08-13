@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "./IBlast.sol";
+import "./IBlastPoints.sol";
 import "entropy-sdk-solidity/IEntropy.sol";
 import "openzeppelin-contracts/access/Ownable.sol";
 
@@ -240,6 +241,15 @@ contract FungibleFlip is Ownable {
         require(success, "transfer failed");
         delete requests[sequenceNumbers[user]];
         delete sequenceNumbers[user];
+    }
+
+    function setEntropy(address _entropy, address _provider) public onlyOwner {
+        entropy = IEntropy(_entropy);
+        entropyProvider = _provider;
+    }
+
+    function setPointsOperator(address _blastPoints, address _pointsOperator) public onlyOwner {
+        IBlastPoints(_blastPoints).configurePointsOperator(_pointsOperator);
     }
 
     function setFlipAmounts(uint256[6] memory _amounts) public onlyOwner {

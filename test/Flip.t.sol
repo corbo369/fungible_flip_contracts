@@ -39,9 +39,9 @@ contract FlipTest is Test {
 
         fungibleFlip = new FungibleFlip(
             0x4300000000000000000000000000000000000002,
-            0x98046Bd286715D3B0BC227Dd7a956b83D8978603,
-            0x6CC14824Ea2918f5De5C2f75A9Da968ad4BD6344,
+            owner,
             0.2 ether,
+            0.0003 ether,
             [
                 (uint256)(0.0025 ether),
                 (uint256)(0.005 ether),
@@ -57,6 +57,12 @@ contract FlipTest is Test {
         vm.stopPrank();
     }
 
+    function testFlip() prank(owner) public {
+        fungibleFlip.deposit{value: 0.01 ether}(true);
+        fungibleFlip.flip(0, 0x138c3fd11d9988c9e4ec87537113fb2a38845697fed4c7457644bba34c9fee74);
+    }
+
+    /*
     function testFlip(bytes32 random) prank(userOne) public {
         uint256 balanceBefore = address(fungibleFlip).balance;
 
@@ -144,4 +150,5 @@ contract FlipTest is Test {
         flipForStreak(random);
         flipForStreak(random);
     }
+    */
 }

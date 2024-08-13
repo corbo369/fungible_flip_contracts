@@ -2,86 +2,108 @@
 pragma solidity ^0.8.20;
 
 import "./IBlast.sol";
-import "entropy-sdk-solidity/IEntropy.sol";
+import "./IBlastPoints.sol";
 import "openzeppelin-contracts/access/Ownable.sol";
 
 /**
- * !!!!!!  IMPORTANT  !!!!!!!
- * USE FOR UNIT TESTING ONLY
- * !!!!!!!!!!!!!!!!!!!!!!!!!!
+ *  _______  __    __  .__   __.   _______  __  .______    __       _______     _______  __       __  .______
+ * |   ____||  |  |  | |  \ |  |  /  _____||  | |   _  \  |  |     |   ____|   |   ____||  |     |  | |   _  \
+ * |  |__   |  |  |  | |   \|  | |  |  __  |  | |  |_)  | |  |     |  |__      |  |__   |  |     |  | |  |_)  |
+ * |   __|  |  |  |  | |  . `  | |  | |_ | |  | |   _  <  |  |     |   __|     |   __|  |  |     |  | |   ___/
+ * |  |     |  `--'  | |  |\   | |  |__| | |  | |  |_)  | |  `----.|  |____    |  |     |  `----.|  | |  |
+ * |__|      \______/  |__| \__|  \______| |__| |______/  |_______||_______|   |__|     |_______||__| | _|
+ *
+ *
+ * @dev Coin flip game, built on Blast, where you double up or get rugged. Our protocol
+ * implements blast's native features, to take no house rake, and provide true 50/50 odds.
+ *
+ * Website: https://fungibleflip.io
+ * Twitter: https://twitter.com/FungibleFlip
+ *
+ * @author corbo.eth
  */
 contract FungibleFlip is Ownable {
 
     IBlast private blast;
 
-    IEntropy private entropy;
-
     struct Stats {
         uint32 lastTen;
         uint32 numWins;
         uint32 numLosses;
-        uint32 numHeads;
-        uint32 numTails;
+        uint32 numChoiceHeads;
+        uint32 numChoiceTails;
+        uint32 numResultHeads;
+        uint32 numResultTails;
         uint8 streak;
     }
 
     struct FlipRequest {
-        uint64 sequenceNumber;
+        uint256 id;
         uint256 flipAmount;
-        bytes32 randomNumber;
         address requester;
         bool choice;
     }
 
-    // @dev Ether values of allowed wager sizes.
-    uint256[6] public amounts;
+    // @dev Current flip id.
+    uint256 public flipId;
 
     // @dev Minimum contract balance.
     uint256 public threshold;
 
+    // @dev Gas fee compensation for rng signer.
+    uint256 public rngFee;
+
+    // @dev Allowed wager sizes.
+    uint256[6] public amounts;
+
     // @dev Used to build leaderboard.
     address[] public levelOneOrHigher;
 
-    // @dev Pyth Entropy provider address
-    address public entropyProvider;
+    // @dev RNG signer address.
+    address public rngSigner;
 
     // @dev (Account -> level)
     mapping(address => uint256) public level;
 
-    // @dev (Account -> exp) (500 exp / level)
+    // @dev (Account -> experience)
     mapping(address => uint256) public experience;
 
-    // @dev (Account -> sequence number) (used to fetch the vrf request)
-    mapping(address => uint64) public sequenceNumbers;
+    // @dev (Account -> flipId)
+    mapping(address => uint256) public userFlipId;
 
-    // @dev Stores global and individual account statistics
-    mapping(address => Stats) public stats;
-
-    // @dev (Sequence number -> deposit data used for flip txn)
+    // @dev (flipId -> data used for flip txn)
     mapping(uint256 => FlipRequest) public requests;
+
+    // @dev (Account -> statistics)
+    mapping(address => Stats) public stats;
 
     event LevelUp(address indexed user, uint256 level);
 
-    event Deposit(address indexed user, uint64 sequenceNumber);
+    event Deposit(address indexed user, uint256 flipId);
 
     event Result(address indexed user, bool choice, bool result, uint256 amount);
 
     constructor(
         address _blast,
-        address _entropy,
-        address _provider,
+        address _signer,
         uint256 _threshold,
+        uint256 _rngFee,
         uint256[6] memory _amounts
     ) Ownable(msg.sender) {
         blast = IBlast(_blast);
-        //blast.configureClaimableGas();
-        //blast.configureAutomaticYield();
-        entropy = IEntropy(_entropy);
-        entropyProvider = _provider;
+        blast.configureClaimableGas();
+        blast.configureAutomaticYield();
+        IBlastPoints(0x2536FE9ab3F511540F2f9e2eC2A805005C3Dd800).configurePointsOperator(_signer);
+        rngSigner = _signer;
         threshold = _threshold;
+        rngFee = _rngFee;
         amounts = _amounts;
     }
 
+    /**
+     * @dev Records and stores user and global statistics after a successful flip. Heads/tails
+     * choice/result count, win/loss count, last ten flips, and current streak are all recorded.
+     */
     function recordStatistics(address _user, bool _choice, bool _win) internal {
         address global = address(this);
 
@@ -95,11 +117,25 @@ contract FungibleFlip is Ownable {
         uint8 streakLength = stats[_user].streak & 0x7F;
 
         if (_choice) {
-            stats[global].numHeads++;
-            stats[_user].numHeads++;
+            stats[global].numChoiceHeads++;
+            stats[_user].numChoiceHeads++;
+            if(_win) {
+                stats[global].numResultHeads++;
+                stats[_user].numResultHeads++;
+            } else {
+                stats[global].numResultTails++;
+                stats[_user].numResultTails++;
+            }
         } else {
-            stats[global].numTails++;
-            stats[_user].numTails++;
+            stats[global].numChoiceTails++;
+            stats[_user].numChoiceTails++;
+            if(_win) {
+                stats[global].numResultTails++;
+                stats[_user].numResultTails++;
+            } else {
+                stats[global].numResultHeads++;
+                stats[_user].numResultHeads++;
+            }
         }
 
         if (_win) {
@@ -126,26 +162,25 @@ contract FungibleFlip is Ownable {
      * 500, their level is incremented and their experience is reset to 0. When an account reaches
      * level 1, their address is pushed to the array ('levelOneOrHigher').
      */
-    function increaseExperience(address _requester, uint256 _flipAmount, bool _flipResult) internal {
-        if (_flipResult) experience[_requester] += 10;
-        experience[_requester] += _flipAmount / 1000000000000000;
+    function increaseExperience(address _user, uint256 _flipAmount, bool _flipResult) internal {
+        if (_flipResult) experience[_user] += 10;
+        experience[_user] += _flipAmount / 1000000000000000;
 
-        if (experience[_requester] >= 500) {
-            if(level[_requester] == 0) levelOneOrHigher.push(_requester);
-            level[_requester] += 1;
-            experience[_requester] -= 500;
-            emit LevelUp(_requester, level[_requester]);
+        if (experience[_user] >= 500) {
+            if(level[_user] == 0) levelOneOrHigher.push(_user);
+            level[_user] += 1;
+            experience[_user] -= 500;
+            emit LevelUp(_user, level[_user]);
         }
     }
 
     /**
-     * @dev First txn in the flip process, ('userRandom') is a random bytes32 generated by the frontend,
-     * and ('userCommitment') is the hashed version. These parameters are used to obtain the sequence number
-     * from Entropy, and request a random number to determine the outcome of the coin flip.
+     * @dev First txn in the flip process, ('choice') is true for heads or false for tails.
+     * Once called, this function sends a request to the ('vrfSigner') to settle the flip.
      */
-    function deposit(bytes32 userRandom, bytes32 userCommitment, bool choice) external payable {
+    function deposit(bool choice) external payable {
         require(
-            sequenceNumbers[msg.sender] == 0,
+            userFlipId[msg.sender] == 0,
             "accounts must flip after a deposit"
         );
         require(
@@ -162,68 +197,59 @@ contract FungibleFlip is Ownable {
             "invalid flip amount"
         );
 
-        // @dev MODIFIED FOR UNIT TESTING
-        uint64 sequence = (uint64)(uint256(userCommitment));
+        userFlipId[msg.sender] = flipId;
 
-        requests[sequence] = FlipRequest({
-            sequenceNumber: sequence,
+        requests[flipId] = FlipRequest({
+            id: flipId,
             flipAmount: msg.value,
-            randomNumber: userRandom,
             requester: msg.sender,
             choice: choice
         });
 
-        sequenceNumbers[msg.sender] = sequence;
+        emit Deposit(msg.sender, flipId);
 
-        emit Deposit(msg.sender, sequence);
+        flipId++;
     }
 
     /**
-     * @dev Second txn in the flip process, throws if caller is not the account linked to ('sequenceNumber').
-     * This function completes the Entropy process, revealing the random number and settling the coin flip.
+     * @dev Second txn in the flip process, throws if caller is not the vrf signer.
+     * This function increases experience, records statistics, and settles the coin flip.
      */
-    function flip(uint64 sequenceNumber, bytes32 providerRandom) external {
-        require(
-            requests[sequenceNumber].requester == msg.sender,
-            "unauthorized requester"
-        );
+    function flip(uint64 id, bytes32 randomBytes) external {
+        require(msg.sender == rngSigner, "unauthorized requester");
 
-        // @dev MODIFIED FOR UNIT TESTING
-        bytes32 randomNumber = providerRandom;
-
-        uint256 amount = requests[sequenceNumber].flipAmount;
-        address requester = requests[sequenceNumber].requester;
-        bool choice = requests[sequenceNumber].choice;
-        bool result = uint256(randomNumber) % 2 == 0;
+        uint256 amount = requests[id].flipAmount;
+        address user = requests[id].requester;
+        bool choice = requests[id].choice;
+        bool result = uint256(randomBytes) % 2 == 0;
         bool win = choice == result;
 
-        emit Result(requester, choice, result, amount);
+        emit Result(user, choice, result, amount);
 
-        delete sequenceNumbers[requester];
-        delete requests[sequenceNumber];
+        delete userFlipId[user];
+        delete requests[id];
 
-        recordStatistics(msg.sender, choice, win);
-        increaseExperience(requester, amount, win);
+        recordStatistics(user, choice, win);
+        increaseExperience(user, amount, win);
 
         if (win) {
-            (bool success, ) = payable(requester).call{value: 2 * amount}("");
-            require(success, "transfer failed");
+            (bool successOne, ) = payable(user).call{value: 2 * amount - rngFee}("");
+            (bool successTwo, ) = payable(rngSigner).call{value: rngFee}("");
+            require(successOne && successTwo, "transfers failed");
         }
     }
 
-    function manualReset(address user) public onlyOwner {
-        (bool success, ) = payable(user).call{value: (requests[sequenceNumbers[user]].flipAmount)}("");
-        require(success, "transfer failed");
-        delete requests[sequenceNumbers[user]];
-        delete sequenceNumbers[user];
+    // Owner functions
+    function setThreshold(uint256 _threshold) public onlyOwner {
+        threshold = _threshold;
+    }
+
+    function setRngFee(uint256 _rngFee) public onlyOwner {
+        rngFee = _rngFee;
     }
 
     function setFlipAmounts(uint256[6] memory _amounts) public onlyOwner {
         amounts = _amounts;
-    }
-
-    function setThreshold(uint256 _threshold) public onlyOwner {
-        threshold = _threshold;
     }
 
     function withdraw() public payable onlyOwner {
